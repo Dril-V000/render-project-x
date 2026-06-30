@@ -2,6 +2,6 @@ Flask==2.3.3
 Flask-SocketIO==5.3.6
 python-socketio==5.11.0
 eventlet==0.35.2
-discord.py==2.3.2
+nextcord==2.6.0
 Werkzeug==2.3.8
 python-dotenv==1.0.0
