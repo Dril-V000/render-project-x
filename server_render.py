@@ -3,54 +3,114 @@ import json
 import asyncio
 import subprocess
 import threading
+import time
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 import discord
 from discord.ext import commands
 
+# ================== قراءة المتغيرات البيئية ==================
+DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
+CHANNEL_ID = int(os.environ.get('CHANNEL_ID', 0))
+
+# 🔑 توكن المصادقة بين السيرفر والعميل
+SERVER_SECRET = os.environ.get('SERVER_SECRET', 'my_super_secret_key_12345')
+
+# التحقق من وجود المتغيرات
+if not DISCORD_TOKEN:
+    print("❌ خطأ: DISCORD_TOKEN غير موجود في المتغيرات البيئية!")
+    print("📌 أضفه في Render: Environment Variables → DISCORD_TOKEN")
+    exit(1)
+
+if not CHANNEL_ID:
+    print("❌ خطأ: CHANNEL_ID غير موجود في المتغيرات البيئية!")
+    print("📌 أضفه في Render: Environment Variables → CHANNEL_ID")
+    exit(1)
+
+print(f"✅ تم قراءة المتغيرات البيئية بنجاح")
+print(f"   - CHANNEL_ID: {CHANNEL_ID}")
+print(f"   - SERVER_SECRET: {'*' * len(SERVER_SECRET)} (مخفي)")
+
 # ================== إعدادات Flask و WebSocket ==================
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_secret_key_here'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your_secret_key_here')
+
+# استخدام eventlet كل async_mode
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # ================== متغيرات عامة ==================
-connected_clients = {}  # {client_id: {'sid': sid, 'name': name, 'ip': ip}}
-client_responses = {}   # {client_id: response_data}
+connected_clients = {}  # {client_name: {'sid': sid, 'name': name, 'ip': ip, 'authenticated': bool}}
+client_responses = {}   # {command_id: response_data}
 discord_queue = []
-DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN', 'ضع_توكن_البوت_هنا')
-CHANNEL_ID = int(os.environ.get('CHANNEL_ID', 123456789))
+failed_attempts = {}    # تتبع محاولات المصادقة الفاشلة
 
 # ================== WebSocket للعملاء ==================
 @socketio.on('connect')
 def handle_connect():
     """عند اتصال عميل جديد"""
-    print(f"[+] عميل متصل: {request.sid}")
-    # العميل سيرسل اسمه بعد الاتصال مباشرة
+    print(f"[+] عميل متصل: {request.sid} من {request.remote_addr}")
+    # نطلب المصادقة فوراً
+    emit('request_auth', {'message': 'يرجى إرسال توكن المصادقة'})
 
-@socketio.on('register')
-def handle_register(data):
-    """تسجيل العميل باسمه"""
+@socketio.on('authenticate')
+def handle_authenticate(data):
+    """مصادقة العميل"""
+    client_token = data.get('token', '')
     client_name = data.get('name', 'Unknown')
-    connected_clients[client_name] = {
-        'sid': request.sid,
-        'name': client_name,
-        'ip': request.remote_addr,
-        'connected_at': datetime.now().isoformat()
-    }
-    print(f"[+] جهاز مسجل: {client_name}")
-    send_to_discord(f"✅ الجهاز **{client_name}** متصل من {request.remote_addr}")
-    emit('registered', {'status': 'success', 'message': f'مرحباً {client_name}'})
+    client_ip = request.remote_addr
+    
+    # التحقق من التوكن
+    if client_token == SERVER_SECRET:
+        # مصادقة ناجحة
+        connected_clients[client_name] = {
+            'sid': request.sid,
+            'name': client_name,
+            'ip': client_ip,
+            'authenticated': True,
+            'connected_at': datetime.now().isoformat()
+        }
+        print(f"[✅] مصادقة ناجحة للجهاز: {client_name} من {client_ip}")
+        send_to_discord(f"✅ الجهاز **{client_name}** متصل من {client_ip}")
+        emit('auth_success', {
+            'status': 'success',
+            'message': f'مرحباً {client_name}، تم المصادقة بنجاح'
+        })
+        
+        if client_ip in failed_attempts:
+            del failed_attempts[client_ip]
+    else:
+        print(f"[❌] محاولة مصادقة فاشلة: {client_name} من {client_ip}")
+        
+        if client_ip not in failed_attempts:
+            failed_attempts[client_ip] = 0
+        failed_attempts[client_ip] += 1
+        
+        if failed_attempts[client_ip] >= 5:
+            print(f"[🚫] تم حظر {client_ip} بسبب محاولات فاشلة متكررة")
+            emit('auth_failed', {
+                'status': 'error',
+                'message': 'تم حظرك بسبب محاولات فاشلة متكررة'
+            })
+            request.disconnect()
+        else:
+            emit('auth_failed', {
+                'status': 'error',
+                'message': f'توكن غير صحيح! المحاولة {failed_attempts[client_ip]} من 5'
+            })
 
 @socketio.on('command_result')
 def handle_command_result(data):
     """استقبال نتيجة الأمر من العميل"""
     client_name = data.get('client_name')
+    if client_name not in connected_clients or not connected_clients[client_name]['authenticated']:
+        print(f"[❌] محاولة غير مصرح بها من {client_name}")
+        return
+    
     result = data.get('result')
     command_id = data.get('command_id')
     
     if client_name in connected_clients:
-        # تخزين النتيجة لاسترجاعها لاحقاً
         client_responses[command_id] = result
         print(f"[+] نتيجة من {client_name}: {result[:50]}...")
 
@@ -67,7 +127,6 @@ def handle_disconnect():
         send_to_discord(f"🔴 الجهاز **{disconnected_name}** غير متصل")
         print(f"[-] عميل غير متصل: {disconnected_name}")
 
-# ================== ديسكورد بوت ==================
 def send_to_discord(message):
     """إضافة رسالة إلى قائمة الانتظار للبوت"""
     discord_queue.append(message)
@@ -82,6 +141,10 @@ async def on_ready():
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
         await channel.send("🖥️ **السيرفر على Render جاهز للعمل!**")
+        await channel.send(f"🔑 **توكن المصادقة:** `{SERVER_SECRET}` (احتفظ به سرياً)")
+    else:
+        print(f"❌ تحذير: لم أجد الشانل {CHANNEL_ID}")
+        print(f"📌 تأكد من أن البوت مضاف إلى السيرفر وأن CHANNEL_ID صحيح")
 
 @bot.event
 async def on_message(message):
@@ -94,9 +157,7 @@ async def on_message(message):
     if not content:
         return
 
-    # ===== أوامر البوت =====
     if content.startswith('!exec'):
-        # !exec <اسم_الجهاز> <الأمر>
         parts = content.split(maxsplit=2)
         if len(parts) < 3:
             await message.channel.send("⚠️ استخدم: `!exec <اسم_الجهاز> <أمر>`")
@@ -108,21 +169,21 @@ async def on_message(message):
             await message.channel.send(f"❌ الجهاز **{client_name}** غير متصل")
             return
         
-        # إرسال الأمر إلى العميل عبر WebSocket
+        if not connected_clients[client_name]['authenticated']:
+            await message.channel.send(f"❌ الجهاز **{client_name}** غير مصرح له")
+            return
+        
         command_id = f"{client_name}_{datetime.now().timestamp()}"
         client_sid = connected_clients[client_name]['sid']
         
         try:
-            # إرسال الأمر للعميل
             socketio.emit('execute_command', {
                 'command': command,
                 'command_id': command_id
             }, room=client_sid)
             
-            # انتظار الرد (مهلة 30 ثانية)
             await asyncio.sleep(30)
             
-            # استرجاع النتيجة
             result = client_responses.pop(command_id, "⏰ انتهت المهلة")
             
             if len(result) > 1900:
@@ -137,7 +198,7 @@ async def on_message(message):
         if not connected_clients:
             await message.channel.send("❌ لا توجد أجهزة متصلة")
             return
-        devices = "\n".join([f"- {name} (منذ {info['connected_at'][:16]})" 
+        devices = "\n".join([f"- {name} {'🔒' if info['authenticated'] else '❌'}" 
                             for name, info in connected_clients.items()])
         await message.channel.send(f"📱 **الأجهزة المتصلة:**\n{devices}")
     
@@ -151,19 +212,20 @@ async def on_message(message):
 **📝 أمثلة:**
 `!exec laptop dir`
 `!exec desktop ipconfig`
-`!exec raspberry python --version`
+
+**🔑 توكن المصادقة:** تم إرساله عند تشغيل البوت
         """
         await message.channel.send(help_text)
     
     elif content == '!ping':
         await message.channel.send("🏓 Pong!")
 
-# ================== تشغيل الخادم ==================
 @app.route('/')
 def index():
     return jsonify({
         'status': 'online',
         'clients': len(connected_clients),
+        'authenticated_clients': sum(1 for c in connected_clients.values() if c['authenticated']),
         'message': '🚀 سيرفر التحكم عن بعد يعمل!'
     })
 
@@ -171,21 +233,26 @@ def index():
 def status():
     return jsonify({
         'connected_clients': list(connected_clients.keys()),
+        'authenticated': [name for name, info in connected_clients.items() if info['authenticated']],
         'total': len(connected_clients)
     })
 
 def run_socketio():
     """تشغيل سيرفر WebSocket"""
-    socketio.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 5000))
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
 
-# ================== التشغيل الرئيسي ==================
 if __name__ == '__main__':
-    # تشغيل بوت ديسكورد في خيط منفصل
     def run_bot():
-        bot.run(DISCORD_TOKEN)
+        try:
+            bot.run(DISCORD_TOKEN)
+        except Exception as e:
+            print(f"❌ خطأ في تشغيل البوت: {e}")
     
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
+    
+    time.sleep(2)
     
     # تشغيل خادم WebSocket
     run_socketio()
