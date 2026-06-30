@@ -6,10 +6,12 @@ import subprocess
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
-import nextcord
-from nextcord.ext import commands
+import discord
+from discord.ext import commands
+import sys
+if not hasattr(sys, 'modules'):
+    sys.modules['audioop'] = None
 
-# ================== قراءة المتغيرات البيئية ==================
 DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
 CHANNEL_ID = int(os.environ.get('CHANNEL_ID', 0))
 SERVER_SECRET = os.environ.get('SERVER_SECRET', 'my_super_secret_key_12345')
@@ -22,19 +24,16 @@ if not CHANNEL_ID:
     print("❌ خطأ: CHANNEL_ID غير موجود")
     exit(1)
 
-print(f"✅ تم قراءة المتغيرات البيئية بنجاح")
+print(f"✅ تم قراءة المتغيرات البيئية: CHANNEL_ID={CHANNEL_ID}")
 
-# ================== إعدادات Flask ==================
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your_secret_key')
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# ================== متغيرات عامة ==================
-connected_clients = {}      # name -> {sid, ip, authenticated}
-client_responses = {}       # command_id -> result
-failed_attempts = {}        # ip -> count
+connected_clients = {}      
+client_responses = {}      
+failed_attempts = {}        
 
-# ================== أحداث WebSocket ==================
 @socketio.on('connect')
 def handle_connect():
     print(f"[+] عميل متصل: {request.sid}")
@@ -60,9 +59,11 @@ def handle_auth(data):
     else:
         print(f"[❌] فشل مصادقة: {name} من {ip}")
         failed_attempts[ip] = failed_attempts.get(ip, 0) + 1
-        emit('auth_failed', {'message': f'توكن خاطئ (المحاولة {failed_attempts[ip]}/5)'})
         if failed_attempts[ip] >= 5:
+            emit('auth_failed', {'message': 'تم حظرك'})
             request.disconnect()
+        else:
+            emit('auth_failed', {'message': f'توكن خاطئ ({failed_attempts[ip]}/5)'})
 
 @socketio.on('command_result')
 def handle_result(data):
@@ -82,8 +83,7 @@ def handle_disconnect():
             print(f"[-] {name} غير متصل")
             break
 
-# ================== ديسكورد بوت (بدون صوت) ==================
-intents = nextcord.Intents.default()
+intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
@@ -92,8 +92,10 @@ async def on_ready():
     print(f'[+] بوت متصل كـ {bot.user}')
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
-        await channel.send("🖥️ **السيرفر جاهز!**")
+        await channel.send("🖥️ **السيرفر جاهز للعمل!**")
         await channel.send(f"🔑 **توكن المصادقة:** `{SERVER_SECRET}`")
+    else:
+        print("❌ الشانل غير موجود! تأكد من CHANNEL_ID")
 
 @bot.event
 async def on_message(message):
@@ -106,48 +108,34 @@ async def on_message(message):
     if not content:
         return
 
-    # ===== أوامر البوت =====
-    
-    # !exec <جهاز> <أمر>
     if content.startswith('!exec'):
         parts = content.split(maxsplit=2)
         if len(parts) < 3:
-            await message.channel.send("⚠️ استخدم: `!exec <اسم_الجهاز> <الأمر>`")
+            await message.channel.send("⚠️ استخدم: `!exec <جهاز> <أمر>`")
             return
 
         _, device, cmd = parts
         
-        # التحقق من وجود الجهاز
         if device not in connected_clients:
             await message.channel.send(f"❌ الجهاز **{device}** غير متصل")
             return
-        
         if not connected_clients[device]['authenticated']:
             await message.channel.send(f"❌ الجهاز **{device}** غير مصرح")
             return
 
-        # إرسال الأمر
         cmd_id = f"{device}_{datetime.now().timestamp()}"
         sid = connected_clients[device]['sid']
         
         try:
-            socketio.emit('execute_command', {
-                'command': cmd,
-                'command_id': cmd_id
-            }, room=sid)
-            
+            socketio.emit('execute_command', {'command': cmd, 'command_id': cmd_id}, room=sid)
             await asyncio.sleep(30)
             result = client_responses.pop(cmd_id, "⏰ انتهت المهلة")
-            
             if len(result) > 1900:
                 result = result[:1900] + "\n... (مقطوع)"
-            
             await message.channel.send(f"💻 **{device}** => `{cmd}`\n```\n{result}\n```")
-            
         except Exception as e:
             await message.channel.send(f"❌ خطأ: {e}")
 
-    # !list - عرض الأجهزة المتصلة
     elif content == '!list':
         if not connected_clients:
             await message.channel.send("❌ لا توجد أجهزة متصلة")
@@ -155,7 +143,6 @@ async def on_message(message):
         devices = "\n".join([f"- {name}" for name in connected_clients])
         await message.channel.send(f"📱 **الأجهزة المتصلة:**\n{devices}")
 
-    # !help
     elif content == '!help':
         help_text = """
 **🤖 الأوامر المتاحة:**
@@ -166,18 +153,14 @@ async def on_message(message):
 **📝 أمثلة:**
 `!exec laptop dir`
 `!exec desktop ipconfig`
-`!exec pc1 whoami`
-`!exec pc2 systeminfo`
 
 **🔑 ملاحظة:** البوت بحاجة إلى صلاحيات مدير لتنفيذ الأوامر
         """
         await message.channel.send(help_text)
 
-    # !ping
     elif content == '!ping':
         await message.channel.send("🏓 Pong!")
 
-# ================== Routes ==================
 @app.route('/')
 def index():
     return jsonify({
@@ -193,9 +176,7 @@ def status():
         'total': len(connected_clients)
     })
 
-# ================== التشغيل ==================
 if __name__ == '__main__':
-    # تشغيل البوت في خيط منفصل
     def run_bot():
         try:
             bot.run(DISCORD_TOKEN)
